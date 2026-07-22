@@ -270,6 +270,73 @@ impl Mailbox {
         }
     }
 
+    async fn change_config(&self, change: ConfChange) -> Result<RaftResponse> {
+        let mut sender = self.sender.clone();
+        let (chan, rx) = oneshot::channel();
+        sender
+            .send(Message::ConfigChange { change, chan })
+            .await
+            .map_err(|e| Error::SendError(e.to_string()))?;
+        match timeout(self.grpc_timeout, rx).await {
+            Ok(Ok(RaftResponse::Error(e))) => Err(Error::from(e)),
+            Ok(Ok(RaftResponse::WrongLeader { .. })) => Err(Error::NotLeader),
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => Err(Error::RecvError(e.to_string())),
+            Err(e) => Err(Error::RecvError(e.to_string())),
+        }
+    }
+
+    /// Promotes an existing learner to a voting member. This must be invoked
+    /// on the current leader after the learner has caught up.
+    pub async fn promote_learner(&self, node_id: u64, node_addr: String) -> Result<()> {
+        let mut change = ConfChange::default();
+        change.set_node_id(node_id);
+        change.set_change_type(ConfChangeType::AddNode);
+        change.set_context(serialize(&node_addr)?);
+        match self.change_config(change).await? {
+            RaftResponse::Ok | RaftResponse::JoinSuccess { .. } => Ok(()),
+            response => Err(Error::from(format!(
+                "unexpected promote learner response: {response:?}"
+            ))),
+        }
+    }
+
+    /// Removes a member through the current leader.
+    pub async fn remove_node(&self, node_id: u64) -> Result<()> {
+        let mut change = ConfChange::default();
+        change.set_node_id(node_id);
+        change.set_change_type(ConfChangeType::RemoveNode);
+        change.set_context(serialize(&RemoveNodeType::Normal)?);
+        match self.change_config(change).await? {
+            RaftResponse::Ok => Ok(()),
+            response => Err(Error::from(format!(
+                "unexpected remove node response: {response:?}"
+            ))),
+        }
+    }
+
+    /// Requests a leadership transfer to a caught-up voter. The call confirms
+    /// that the request was accepted; callers should poll status to confirm the
+    /// new leader.
+    pub async fn transfer_leader(&self, node_id: u64) -> Result<()> {
+        let mut sender = self.sender.clone();
+        let (chan, rx) = oneshot::channel();
+        sender
+            .send(Message::TransferLeader { node_id, chan })
+            .await
+            .map_err(|e| Error::SendError(e.to_string()))?;
+        match timeout(self.grpc_timeout, rx).await {
+            Ok(Ok(RaftResponse::Ok)) => Ok(()),
+            Ok(Ok(RaftResponse::Error(e))) => Err(Error::from(e)),
+            Ok(Ok(RaftResponse::WrongLeader { .. })) => Err(Error::NotLeader),
+            Ok(Ok(response)) => Err(Error::from(format!(
+                "unexpected transfer leader response: {response:?}"
+            ))),
+            Ok(Err(e)) => Err(Error::RecvError(e.to_string())),
+            Err(e) => Err(Error::RecvError(e.to_string())),
+        }
+    }
+
     /// Retrieves the current status of the Raft node.
     /// Sends a `Message::Status` request and waits for a `RaftResponse::Status` reply, which contains the node's status.
     #[inline]
@@ -520,6 +587,43 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         leader_id: Option<u64>,
         leader_addr: String,
     ) -> Result<()> {
+        self.join_with_role(
+            node_id,
+            node_addr,
+            leader_id,
+            leader_addr,
+            ConfChangeType::AddNode,
+        )
+        .await
+    }
+
+    /// Joins an existing cluster as a non-voting learner. The learner must be
+    /// explicitly promoted by the leader after its replicated state catches up.
+    pub async fn join_as_learner(
+        self,
+        node_id: u64,
+        node_addr: String,
+        leader_id: Option<u64>,
+        leader_addr: String,
+    ) -> Result<()> {
+        self.join_with_role(
+            node_id,
+            node_addr,
+            leader_id,
+            leader_addr,
+            ConfChangeType::AddLearnerNode,
+        )
+        .await
+    }
+
+    async fn join_with_role(
+        self,
+        node_id: u64,
+        node_addr: String,
+        leader_id: Option<u64>,
+        leader_addr: String,
+        join_change_type: ConfChangeType,
+    ) -> Result<()> {
         // 1. try to discover the leader and obtain an id from it, if leader_id is None.
         info!("attempting to join peer cluster at {}", leader_addr);
         let (leader_id, leader_addr): (u64, String) = if let Some(leader_id) = leader_id {
@@ -576,7 +680,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
             // TODO: handle wrong leader
             let mut change = ConfChange::default();
             change.set_node_id(node_id);
-            change.set_change_type(ConfChangeType::AddNode);
+            change.set_change_type(join_change_type);
             change.set_context(serialize(&node_addr)?);
             // change.set_context(serialize(&node_addr)?);
 
