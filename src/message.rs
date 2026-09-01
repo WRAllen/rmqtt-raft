@@ -73,6 +73,8 @@ pub enum Message {
     },
     /// Snapshot
     Snapshot { snapshot: Snapshot },
+    /// Gracefully stops the local Raft event loop.
+    Shutdown { chan: Sender<RaftResponse> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

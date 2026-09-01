@@ -1085,6 +1085,11 @@ impl<S: Store + 'static> RaftNode<S> {
                 Ok(Some(Message::Snapshot { snapshot })) => {
                     self.set_snapshot(snapshot);
                 }
+                Ok(Some(Message::Shutdown { chan })) => {
+                    info!("graceful raft shutdown requested for node {}", self.id());
+                    self.should_quit = true;
+                    let _ = chan.send(RaftResponse::Ok);
+                }
                 Ok(Some(Message::ReportUnreachable { node_id })) => {
                     debug!(
                         "Message::ReportUnreachable, node_id: {}, sending_raft_messages: {}",

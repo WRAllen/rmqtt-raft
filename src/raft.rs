@@ -11,7 +11,7 @@ use futures::SinkExt;
 use log::{debug, info, warn};
 use prost::Message as _;
 use tikv_raft::eraftpb::{ConfChange, ConfChangeType};
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tokio::time::timeout;
 use tonic::Request;
 
@@ -163,6 +163,7 @@ type LeaderInfoError = ByteString;
 pub struct Mailbox {
     peers: Arc<DashMap<(u64, String), Peer>>,
     sender: mpsc::Sender<Message>,
+    shutdown: watch::Sender<bool>,
     grpc_timeout: Duration,
     grpc_concurrency_limit: usize,
     grpc_message_size: usize,
@@ -185,6 +186,7 @@ impl Mailbox {
     pub(crate) fn new(
         peers: Arc<DashMap<(u64, String), Peer>>,
         sender: mpsc::Sender<Message>,
+        shutdown: watch::Sender<bool>,
         grpc_timeout: Duration,
         grpc_concurrency_limit: usize,
         grpc_message_size: usize,
@@ -194,6 +196,7 @@ impl Mailbox {
         Self {
             peers,
             sender,
+            shutdown,
             grpc_timeout,
             grpc_concurrency_limit,
             grpc_message_size,
@@ -201,6 +204,36 @@ impl Mailbox {
             grpc_breaker_retry_interval,
             leader_info: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Gracefully stops the local Raft node and its gRPC listener.
+    ///
+    /// This is intended for explicit lifecycle management. It does not run on
+    /// the proposal or query fast paths.
+    pub async fn shutdown(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let result = match self
+            .sender
+            .clone()
+            .send(Message::Shutdown { chan: tx })
+            .await
+        {
+            Ok(()) => match timeout(self.grpc_timeout, rx).await {
+                Ok(Ok(RaftResponse::Ok)) => Ok(()),
+                Ok(Ok(RaftResponse::Error(error))) => Err(Error::Msg(error)),
+                Ok(Ok(response)) => Err(Error::Msg(format!(
+                    "unexpected raft shutdown response: {response:?}"
+                ))),
+                Ok(Err(error)) => Err(Error::RecvError(error.to_string())),
+                Err(error) => Err(error.into()),
+            },
+            Err(error) => Err(Error::SendError(error.to_string())),
+        };
+
+        // Always release the listener, even when the event loop has already
+        // stopped and can no longer acknowledge the shutdown message.
+        let _ = self.shutdown.send(true);
+        result
     }
 
     /// Retrieves a list of peers with their IDs.
@@ -516,6 +549,7 @@ pub struct Raft<S: Store + 'static> {
     laddr: SocketAddr,
     logger: slog::Logger,
     cfg: Arc<Config>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl<S: Store + Send + Sync + 'static> Raft<S> {
@@ -532,6 +566,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
             .next()
             .ok_or_else(|| Error::from("None"))?;
         let (tx, rx) = mpsc::channel(100_000);
+        let (shutdown, _) = watch::channel(false);
         let cfg = Arc::new(cfg);
         Ok(Self {
             store,
@@ -540,6 +575,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
             laddr,
             logger,
             cfg,
+            shutdown,
         })
     }
 
@@ -548,6 +584,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         Mailbox::new(
             Arc::new(DashMap::default()),
             self.tx.clone(),
+            self.shutdown.clone(),
             self.cfg.grpc_timeout,
             self.cfg.grpc_concurrency_limit,
             self.cfg.grpc_message_size,
@@ -640,7 +677,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         node.add_peer(&node_addr, node_id);
         let server = RaftServer::new(self.tx, self.laddr, self.cfg.clone());
         let server_handle = async {
-            if let Err(e) = server.run().await {
+            if let Err(e) = server.run(self.shutdown.subscribe()).await {
                 warn!("raft server run error: {:?}", e);
                 Err(e)
             } else {
@@ -746,7 +783,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
                 .await?;
         let server = RaftServer::new(self.tx, self.laddr, self.cfg.clone());
         let server_handle = async {
-            if let Err(e) = server.run().await {
+            if let Err(e) = server.run(self.shutdown.subscribe()).await {
                 warn!("raft server run error: {:?}", e);
                 Err(e)
             } else {
@@ -824,6 +861,53 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct TestStore;
+
+    #[async_trait]
+    impl Store for TestStore {
+        async fn apply(&mut self, message: &[u8]) -> Result<Vec<u8>> {
+            Ok(message.to_vec())
+        }
+
+        async fn query(&self, query: &[u8]) -> Result<Vec<u8>> {
+            Ok(query.to_vec())
+        }
+
+        async fn snapshot(&self) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn restore(&mut self, _snapshot: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_stops_the_raft_runtime() {
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        let raft = Raft::new("127.0.0.1:0", TestStore, logger, Config::default()).unwrap();
+        let mailbox = raft.mailbox();
+        let runtime = tokio::spawn(raft.lead(1, "127.0.0.1:0".to_string()));
+
+        let mut started = false;
+        for _ in 0..50 {
+            if mailbox.status().await.is_ok() {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(started, "raft runtime did not start");
+
+        mailbox.shutdown().await.unwrap();
+        let result = timeout(Duration::from_secs(5), runtime)
+            .await
+            .expect("raft runtime did not stop")
+            .expect("raft runtime task panicked");
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn join_connect_retry_delay_is_bounded() {
