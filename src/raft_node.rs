@@ -1085,6 +1085,11 @@ impl<S: Store + 'static> RaftNode<S> {
                 Ok(Some(Message::Snapshot { snapshot })) => {
                     self.set_snapshot(snapshot);
                 }
+                Ok(Some(Message::Shutdown { chan })) => {
+                    info!("graceful raft shutdown requested for node {}", self.id());
+                    self.should_quit = true;
+                    let _ = chan.send(RaftResponse::Ok);
+                }
                 Ok(Some(Message::ReportUnreachable { node_id })) => {
                     debug!(
                         "Message::ReportUnreachable, node_id: {}, sending_raft_messages: {}",
@@ -1564,5 +1569,61 @@ mod tests {
 
         assert!(!heartbeat_commit_exceeds_last_index(&append, 10));
         assert!(!heartbeat_commit_exceeds_last_index(&snapshot, 10));
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_transport_reports_failure_and_releases_message_count() {
+        for message_type in [MessageType::MsgSnapshot, MessageType::MsgAppend] {
+            // Reserve the endpoint for the whole attempt but never accept its
+            // HTTP/2 handshake. This is a local, bounded transport failure,
+            // without racing another test for an unbound port.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let peer = Peer::new(
+                addr.to_string(),
+                Duration::from_millis(100),
+                1,
+                1024,
+                1,
+                0,
+            );
+            let (chan, reports) = mpsc::channel(4);
+            let sending = Arc::new(AtomicIsize::new(0));
+            let sender = MessageSender {
+                message: raft_message(message_type, 0),
+                client: peer,
+                client_id: 42,
+                chan,
+                max_retries: 0,
+                timeout: Duration::from_millis(10),
+                sending_raft_messages: sending.clone(),
+            };
+
+            let reports = timeout(Duration::from_secs(3), async {
+                sender.send().await;
+                reports.collect::<Vec<_>>().await
+            })
+            .await
+            .expect("failed Raft transport did not finish within its deadline");
+
+            assert_eq!(sending.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                reports.first(),
+                Some(Message::ReportUnreachable { node_id: 42 })
+            ));
+            if message_type == MessageType::MsgSnapshot {
+                assert_eq!(reports.len(), 2);
+                assert!(matches!(
+                    reports.get(1),
+                    Some(Message::ReportSnapshot {
+                        node_id: 42,
+                        success: false,
+                    })
+                ));
+            } else {
+                assert_eq!(reports.len(), 1, "ordinary messages must not report snapshots");
+            }
+            drop(listener);
+        }
     }
 }
